@@ -13,10 +13,13 @@ import {
   MarkerOptions,
   OnCameraChangeListener,
   OnMarkerDragListener,
+  OnLocationChangedListener,
   Poi,
   PolygonOptions,
   Polyline,
-  PolylineOptions
+  PolylineOptions,
+  MyLocationStyle,
+  LocationSource
 } from '@amap/amap_lbs_map3d';
 
 import { Descriptor, RNComponentContext, RNOHContext, RNViewBase, ViewBaseProps } from '@rnoh/react-native-openharmony';
@@ -26,8 +29,14 @@ import { A_MAP_POLYLINE_TYPE, AMapPolylineProps } from './AMapPolyline';
 import { A_MAP_MARKER_TYPE, AMapMarkerProps } from './AMapMarker';
 
 import Logger from '../Logger';
-import { ArrayList, HashMap } from '@kit.ArkTS';
+import { ArrayList, HashMap, JSON } from '@kit.ArkTS';
 import GlobalCache from '../GlobalCache';
+import { application } from '@kit.AbilityKit';
+import { BusinessError } from '@kit.BasicServicesKit';
+import geoLocationManager from '@ohos.geoLocationManager';
+import {
+  AMapLocationManagerImpl,
+  AMapLocationOption, AMapLocationReGeocodeLanguage, AMapLocationType, IAMapLocationListener } from '@amap/amap_lbs_location';
 import { DownloadIcon } from '../DownloadIcon';
 
 export interface MapViewProps extends ViewBaseProps {
@@ -56,7 +65,7 @@ const MAP_SHOW_FUNC = 'AMapView';
 
 export const GOADE_MAP_VIEW_TYPE: string = "AMapView"
 
-export type GDMapViewDescriptor = Descriptor<"AMapView", MapViewProps>;
+export type GDMapViewDescriptor = Descriptor<"AMapView", '', '', MapViewProps>;
 
 export let globalContext: Context;
 
@@ -70,13 +79,14 @@ export struct AMapView {
   polyLineTag: Array<number> = []
   markerTag: Array<number> = []
   @State gDMapDescriptor: GDMapViewDescriptor = {} as GDMapViewDescriptor
+  private intervalId: number = 0;
   private unregisterDescriptorChangesListener?: () => void = undefined
   private cleanupCallback?: () => void = undefined;
   private markers : Array<Marker> = new Array();
   private polylines : Array<Polyline> = new Array();
   private markerTagAndDescriptorTagArray : Array<HashMap<number, string>> = new Array();
   private polylineTagAndDescriptorTagArray : Array<HashMap<number, string>> = new Array();
-
+  private mapListener?: OnLocationChangedListener;
   aboutToAppear(): void {
     this.cleanupCallback = this.ctx.componentCommandReceiver.registerCommandCallback(
       this.tag,
@@ -85,7 +95,7 @@ export struct AMapView {
           this.aMap?.animateCamera(CameraUpdateFactory.newCameraPosition(args[0]), null, args[1]);
         }
       });
-    globalContext = getContext().getApplicationContext();
+    globalContext = application.getApplicationContext();
     this.gDMapDescriptor = this.ctx.descriptorRegistry.getDescriptor<GDMapViewDescriptor>(this.tag);
     // GlobalCache.markerProp = new HashMap();
     this.getProp(this.gDMapDescriptor);
@@ -96,7 +106,17 @@ export struct AMapView {
           GlobalCache.mapPolyLine.clear();
           /*------ 当RN侧属性props有更改 -------*/
           this.gDMapDescriptor = (newDescriptor as GDMapViewDescriptor)
+          let oldMyLocationEnabled = this.myLocationEnabled;
           this.getProp(this.gDMapDescriptor);
+          if (oldMyLocationEnabled !== this.myLocationEnabled) {
+            this.aMap.setMyLocationEnabled(this.myLocationEnabled);
+            if (this.myLocationEnabled) {
+              this.startLocationUpdates();
+            } else {
+              this.stopLocationUpdates();
+            }
+          }
+
           this.getOverlay(this.gDMapDescriptor);
         }
 
@@ -120,7 +140,8 @@ export struct AMapView {
     GlobalCache.circleCacheMap.clear();
   }
 
-  //地图
+  locationManager?:AMapLocationManagerImpl
+  private locationStyle: MyLocationStyle = new MyLocationStyle();
   private mapView?: MapView;
   private aMap?: AMap;
   mapType: number = 1;
@@ -235,13 +256,15 @@ export struct AMapView {
     mapview.onCreate();
     GlobalCache.mapViews.set(this.tag, mapview);
     this.mapView = GlobalCache.mapViews.get(this.tag);
-    this.mapView.getMapAsync((map:AMap) => {
+    this.mapView.getMapAsync(async (map: AMap) => {
       GlobalCache.maps.set(this.tag, map);
       this.aMap = GlobalCache.maps.get(this.tag);
+      this.aMap.setLocationSource(this);
       this.getOverlay(this.gDMapDescriptor);
       if (this.initialCameraPosition != null) {
         this.aMap?.moveCamera(CameraUpdateFactory.newCameraPosition(this.initialCameraPosition));
       }
+
       this.aMap?.setOnMapClickListener((point: LatLng) => {
         this.onClickFunction(point)
       });
@@ -271,6 +294,7 @@ export struct AMapView {
       // 注：只有在有室内地图显示的情况下最大级别为20，否则最大级别为19。
       this.aMap.setMinZoomLevel(this.minZoom);
       this.aMap.setMaxZoomLevel(this.maxZoom);
+      this.aMap.setLocationSource(this);
       this.aMap.setMyLocationEnabled(this.myLocationEnabled);
       //设置最小缩放级别 缩放级别范围为[3, 20],超出范围将按最小级别计算
       this.aMap.showBuildings(this.buildingsEnabled);
@@ -284,8 +308,16 @@ export struct AMapView {
       uiSettings?.setCompassEnabled(this.compassEnabled);
       uiSettings?.setMyLocationButtonEnabled(this.myLocationButtonEnabled);
       uiSettings?.setZoomControlsEnabled(this.zoomControlsEnabled);
-
       this.onLoadFunction();
+      if (this.myLocationEnabled) {
+        setTimeout(() => {
+          if (this.aMap) {
+            const targetType = MyLocationStyle.LOCATION_TYPE_LOCATION_ROTATE_NO_CENTER;
+            this.locationStyle.myLocationType(targetType);
+            this.aMap.setMyLocationStyle(this.locationStyle);
+          }
+        },50);
+      }
       this.aMap?.setOnPolylineClickListener((polyLine: Polyline): void => {
         let len: number | undefined = GlobalCache.mapPolyLine.get(this.tag)?.length;
         let polyLinesArray: Array<Polyline> | undefined = GlobalCache.mapPolyLine.get(this.tag);
@@ -352,8 +384,7 @@ export struct AMapView {
               }
             }
           }
-        })
-      )
+        }))
     })
   }
 
@@ -365,78 +396,78 @@ export struct AMapView {
    * 获取rn侧传递多来的prop
    */
   private getProp(descriptor: GDMapViewDescriptor) {
-    this.mapType = descriptor.props.mapType;
+    this.mapType = descriptor.rawProps.mapType;
     //初始位置
-    if (descriptor.props.initialCameraPosition != null) {
-      this.initialCameraPosition = descriptor.props.initialCameraPosition;
+    if (descriptor.rawProps.initialCameraPosition != null) {
+      this.initialCameraPosition = descriptor.rawProps.initialCameraPosition;
     }
     //是否显示当前定位
-    if (descriptor.props.myLocationEnabled != null) {
-      this.myLocationEnabled = descriptor.props.myLocationEnabled;
+    if (descriptor.rawProps.myLocationEnabled != null) {
+      this.myLocationEnabled = descriptor.rawProps.myLocationEnabled;
     }
     //是否显示室内地图
-    if (descriptor.props.indoorViewEnabled != null) {
-      this.indoorViewEnabled = descriptor.props.indoorViewEnabled;
+    if (descriptor.rawProps.indoorViewEnabled != null) {
+      this.indoorViewEnabled = descriptor.rawProps.indoorViewEnabled;
     }
     //是否显示3D建筑
-    if (descriptor.props.buildingsEnabled != null) {
-      this.buildingsEnabled = descriptor.props.buildingsEnabled;
+    if (descriptor.rawProps.buildingsEnabled != null) {
+      this.buildingsEnabled = descriptor.rawProps.buildingsEnabled;
     }
     //是否显示标注
-    if (descriptor.props.labelsEnabled != null) {
-      this.labelsEnabled = descriptor.props.labelsEnabled;
+    if (descriptor.rawProps.labelsEnabled != null) {
+      this.labelsEnabled = descriptor.rawProps.labelsEnabled;
     }
     //是否显示指南针
-    if (descriptor.props.compassEnabled != null) {
-      this.compassEnabled = descriptor.props.compassEnabled;
+    if (descriptor.rawProps.compassEnabled != null) {
+      this.compassEnabled = descriptor.rawProps.compassEnabled;
     }
     //是否显示放大缩小按钮
-    if (descriptor.props.zoomControlsEnabled != null) {
-      this.zoomControlsEnabled = descriptor.props.zoomControlsEnabled;
+    if (descriptor.rawProps.zoomControlsEnabled != null) {
+      this.zoomControlsEnabled = descriptor.rawProps.zoomControlsEnabled;
     }
 
-    if (descriptor.props.myLocationButtonEnabled != null) {
-      this.myLocationButtonEnabled = descriptor.props.myLocationButtonEnabled;
+    if (descriptor.rawProps.myLocationButtonEnabled != null) {
+      this.myLocationButtonEnabled = descriptor.rawProps.myLocationButtonEnabled;
     }
     //是否显示比例尺
-    if (descriptor.props.scaleControlsEnabled != null) {
-      this.scaleControlsEnabled = descriptor.props.scaleControlsEnabled;
+    if (descriptor.rawProps.scaleControlsEnabled != null) {
+      this.scaleControlsEnabled = descriptor.rawProps.scaleControlsEnabled;
     }
     //是否显示路况
-    if (descriptor.props.trafficEnabled != null) {
-      this.trafficEnabled = descriptor.props.trafficEnabled;
+    if (descriptor.rawProps.trafficEnabled != null) {
+      this.trafficEnabled = descriptor.rawProps.trafficEnabled;
     }
     //最大缩放级别
-    if (descriptor.props.maxZoom != null) {
-      this.maxZoom = descriptor.props.maxZoom;
+    if (descriptor.rawProps.maxZoom != null) {
+      this.maxZoom = descriptor.rawProps.maxZoom;
     }
     //最小缩放级别
-    if (descriptor.props.minZoom != null) {
-      this.minZoom = descriptor.props.minZoom;
+    if (descriptor.rawProps.minZoom != null) {
+      this.minZoom = descriptor.rawProps.minZoom;
     }
     //是否启用缩放手势，用于放大缩小
-    if (descriptor.props.zoomGesturesEnabled != null) {
-      this.zoomGesturesEnabled = descriptor.props.zoomGesturesEnabled;
+    if (descriptor.rawProps.zoomGesturesEnabled != null) {
+      this.zoomGesturesEnabled = descriptor.rawProps.zoomGesturesEnabled;
     }
     //是否启用滑动手势，用于平移
-    if (descriptor.props.scrollGesturesEnabled != null) {
-      this.scrollGesturesEnabled = descriptor.props.scrollGesturesEnabled;
+    if (descriptor.rawProps.scrollGesturesEnabled != null) {
+      this.scrollGesturesEnabled = descriptor.rawProps.scrollGesturesEnabled;
     }
     //是否启用旋转手势，用于调整方向
-    if (descriptor.props.rotateGesturesEnabled != null) {
-      this.rotateGesturesEnabled = descriptor.props.rotateGesturesEnabled;
+    if (descriptor.rawProps.rotateGesturesEnabled != null) {
+      this.rotateGesturesEnabled = descriptor.rawProps.rotateGesturesEnabled;
     }
     //是否启用倾斜手势，用于改变视角
-    if (descriptor.props.tiltGesturesEnabled != null) {
-      this.tiltGesturesEnabled = descriptor.props.tiltGesturesEnabled;
+    if (descriptor.rawProps.tiltGesturesEnabled != null) {
+      this.tiltGesturesEnabled = descriptor.rawProps.tiltGesturesEnabled;
     }
     //设定定位的最小更新距离  @platform ios
-    if (descriptor.props.distanceFilter != null) {
-      this.distanceFilter = descriptor.props.distanceFilter;
+    if (descriptor.rawProps.distanceFilter != null) {
+      this.distanceFilter = descriptor.rawProps.distanceFilter;
     }
     //设定最小更新角度，默认为 1 度    @platform ios
-    if (descriptor.props.headingFilter != null) {
-      this.headingFilter = descriptor.props.headingFilter;
+    if (descriptor.rawProps.headingFilter != null) {
+      this.headingFilter = descriptor.rawProps.headingFilter;
     }
   }
 
@@ -451,7 +482,7 @@ export struct AMapView {
         case A_MAP_CIRCLE_VIEW_TYPE:
           let circleOptions = new CircleOptions();
           let circleProp =
-            this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).props as AMapCircleProps;
+            this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).rawProps as AMapCircleProps;
           let childCircleTag: number = this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).tag;
           let circle = this.aMap?.addCircle(circleOptions);
           //Put the overlay ring in the cache and hot-update the properties to modify
@@ -471,7 +502,7 @@ export struct AMapView {
           let childPolygonTag: number = this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).tag;
           GlobalCache.polygonCacheMap.set(childPolygonTag, polygon);
           let mapPolygonProp =
-            this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).props as AMapPolygonProps;
+            this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).rawProps as AMapPolygonProps;
           if (polygon) {
             let polygonOptionsList = new ArrayList<LatLng>()
             for (let index = 0; index < mapPolygonProp.points.length; index++) {
@@ -490,7 +521,7 @@ export struct AMapView {
         case A_MAP_POLYLINE_TYPE:
           flagLine = false;
           let mapPolylineProp =
-            this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).props as AMapPolylineProps;
+            this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).rawProps as AMapPolylineProps;
           let childPolyLineTag: number = this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i]).tag;
           let GlobalCachePolyLines : Array<Polyline> = GlobalCache.mapPolyLine.get(this.tag) ?? [];
           let polyLinesTagAndDescriptorTagArray: Array<HashMap<number, string>> = GlobalCache.polyLinesTagAndDescriptorTag.get(this.tag) ?? [];
@@ -504,7 +535,8 @@ export struct AMapView {
                     GlobalCachePolyLines[polylineIndex].setZIndex(mapPolylineProp.zIndex ? mapPolylineProp.zIndex : 1);
                     GlobalCachePolyLines[polylineIndex].setDottedLine(mapPolylineProp.dotted ? mapPolylineProp.dotted : false);
                     GlobalCachePolyLines[polylineIndex].setGeodesic(mapPolylineProp.geodesic ? mapPolylineProp.geodesic : false);
-                    GlobalCachePolyLines[polylineIndex].setWidth(mapPolylineProp.width ? vp2px(mapPolylineProp.width) : vp2px(5));
+                    GlobalCachePolyLines[polylineIndex].setWidth(mapPolylineProp.width ?
+                    this.getUIContext().vp2px(mapPolylineProp.width) :   this.getUIContext().vp2px(5));
                     if (mapPolylineProp.color) {
                       GlobalCachePolyLines[polylineIndex].setColor(rgbaToHex(mapPolylineProp.color ? mapPolylineProp.color :
                         "rgba(0, 255, 0, 0.5)"));
@@ -549,7 +581,8 @@ export struct AMapView {
                     .setZIndex(mapPolylineProp.zIndex ? mapPolylineProp.zIndex : 1)
                     .setDottedLine(mapPolylineProp.dotted ? mapPolylineProp.dotted : false)
                     .setGeodesic(mapPolylineProp.geodesic ? mapPolylineProp.geodesic : false)
-                    .setWidth(mapPolylineProp.width ? vp2px(mapPolylineProp.width) : vp2px(5))
+                    .setWidth(mapPolylineProp.width ?
+                    this.getUIContext().vp2px(mapPolylineProp.width) : this.getUIContext().vp2px(5))
                     .setGradient(mapPolylineProp.gradient ? mapPolylineProp.gradient : false));
                 if(polyline){
                   polyline.setPoints(polylineOptionsList);
@@ -569,7 +602,7 @@ export struct AMapView {
         case A_MAP_MARKER_TYPE:
           let markerDescriptor: Descriptor = this.ctx.descriptorRegistry.getDescriptor(descriptor.childrenTags[i])
           let markerChild: number[] = markerDescriptor.childrenTags;
-          let mapMarkerProps = markerDescriptor.props as AMapMarkerProps;
+          let mapMarkerProps = markerDescriptor.rawProps as AMapMarkerProps;
           this.markers = (GlobalCache.mapMarker.get(this.tag) ?? []);
           let markerTagAndDescriptorTagArray = GlobalCache.markerTagAndDescriptorTag.get(this.tag) ?? [];
 
@@ -667,15 +700,63 @@ export struct AMapView {
       flagLine = false;
     }
   }
+  private  startLocationUpdates() {
+    if (this.myLocationEnabled) {
+      let options: AMapLocationOption = {
+        priority: geoLocationManager.LocationRequestPriority.FIRST_FIX,
+        scenario: geoLocationManager.LocationRequestScenario.UNSET,
+        timeInterval: 2000,
+        distanceInterval: 0,
+        maxAccuracy: 20,
+        allowsBackgroundLocationUpdates: false,
+        locatingWithReGeocode: true,
+        reGeocodeLanguage: AMapLocationReGeocodeLanguage.Chinese,
+        isOffset: true
+      };
+      let locationListener: IAMapLocationListener = {
+        onLocationChanged: (location) => {
+          this.mapListener?.onLocationChanged(location)
+        },
+        onLocationError: (error) => {
+          console.error('失败: ' + JSON.stringify(error));
+        }
+      };
+      this.locationManager = new AMapLocationManagerImpl(globalContext);
+      this.locationManager?.setLocationListener(AMapLocationType.Updating, locationListener);
+      this.locationManager?.setLocationOption(AMapLocationType.Updating, options);
+      this.locationManager?.startUpdatingLocation();
 
+    }
+  }
+
+  private stopLocationUpdates() {
+    this.locationManager?.stopUpdatingLocation();
+  }
   @Builder
   customMarkerBuilder(markerTag: number) {
     ContentSlot(this.ctx.getContentForTag(markerTag))
   }
 
+  activate(listener: OnLocationChangedListener): void {
+    this.mapListener = listener;
+    this.locationStyle.myLocationType(MyLocationStyle.LOCATION_TYPE_LOCATION_ROTATE_NO_CENTER);
+    this.aMap?.setMyLocationStyle(this.locationStyle);
+    if (this.myLocationEnabled) {
+      this.startLocationUpdates();
+    }
+  }
+
+  deactivate() {
+    if (this.intervalId > 0) {
+      clearInterval(this.intervalId);
+      this.intervalId = 0;
+    }
+  }
+
   build() {
     RNViewBase({ ctx: this.ctx, tag: this.tag }) {
       MapViewComponent({ mapViewName: new String(this.tag).valueOf() }).width('100%').height('100%')
+
     }
   }
 }
